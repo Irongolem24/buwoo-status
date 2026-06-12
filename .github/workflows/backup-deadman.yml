@@ -1,0 +1,48 @@
+# 부우 백업 dead-man 감시 (2026-06-12, 안정성 보험 트랙 ①)
+# 매일 04:30 KST (= 02:00 KST 백업 후): R2 의 최신 DB 덤프가 26시간보다 오래되면 텔레그램 경보.
+# 서버가 통째로 죽어 백업이 조용히 멈춰도, 이 검사는 GitHub(외부)에서 돌므로 반드시 울린다.
+name: backup-deadman
+on:
+  schedule:
+    - cron: "30 19 * * *" # 19:30 UTC = 다음날 04:30 KST
+  workflow_dispatch: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: check-r2-backup-freshness
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+        run: |
+          set -u
+          send_tg() {
+            curl -s --max-time 20 -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+              -d chat_id="${TG_CHAT}" --data-urlencode text="$1" >/dev/null || true
+          }
+          sudo apt-get update -qq >/dev/null && sudo apt-get install -y -qq rclone >/dev/null
+          NOW_KST=$(TZ=Asia/Seoul date "+%m월 %d일 %H:%M")
+          if ! LIST=$(rclone lsjson r2:buwoo-vps-backup/full --files-only 2>&1); then
+            echo "$LIST"
+            send_tg "🚨 부우 백업 점검 실패 (${NOW_KST} 한국시간) — 백업 저장소(R2)에 접근할 수 없습니다. 자격증명 또는 저장소 문제일 수 있어요."
+            exit 1
+          fi
+          NEWEST=$(echo "$LIST" | jq -r 'max_by(.ModTime).ModTime // empty')
+          if [ -z "$NEWEST" ]; then
+            send_tg "🚨 부우 백업 경보 (${NOW_KST} 한국시간) — 백업 저장소에 DB 덤프가 하나도 없습니다."
+            exit 1
+          fi
+          AGE_H=$(( ( $(date +%s) - $(date -d "$NEWEST" +%s) ) / 3600 ))
+          echo "newest dump: $NEWEST (age ${AGE_H}h)"
+          if [ "$AGE_H" -gt 26 ]; then
+            send_tg "🚨 부우 백업 경보 (${NOW_KST} 한국시간) — 마지막 DB 백업이 ${AGE_H}시간 전입니다 (정상: 24시간 이내). 서버의 백업 작업이 멈췄을 수 있어요."
+            exit 1
+          fi
+          echo "backup fresh (${AGE_H}h) — OK"

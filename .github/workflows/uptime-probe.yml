@@ -1,0 +1,74 @@
+# 부우 외부 업타임 감시 (2026-06-12, 안정성 보험 트랙 ①)
+# - 30분마다 GitHub Actions 러너(외부망)에서 핵심 도메인 6곳을 점검
+# - 실패 시(10초 후 재시도 1회 포함) 대표 텔레그램으로 즉시 알림, 복구되면 복구 알림 1회
+# - 수동 실행(Actions 탭 → Run workflow)에서 simulate_failure 에 아무 값이나 넣으면
+#   실제 장애 없이 알림 전달만 테스트할 수 있다
+# - 주기를 30분보다 줄이면 GitHub 무료 분량(월 2,000분, private repo)을 초과하니 주의
+# - 주의: run 블록 안에서 0열로 시작하는 줄을 만들면 YAML 블록이 끊긴다 → 줄바꿈은 $'\n' 로
+name: uptime-probe
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      simulate_failure:
+        description: "아무 값이나 넣으면 강제 실패 (알림 전달 테스트)"
+        required: false
+        default: ""
+
+permissions:
+  actions: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: probe-and-alert
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GH_TOKEN: ${{ github.token }}
+          SIMULATE: ${{ inputs.simulate_failure }}
+        run: |
+          set -u
+          NL=$'\n'
+          send_tg() {
+            curl -s --max-time 20 -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+              -d chat_id="${TG_CHAT}" --data-urlencode text="$1" >/dev/null || true
+          }
+          declare -A TARGETS=(
+            ["https://status.buwoo.app"]="웹 서버(Caddy)"
+            ["https://api.buwoo.app/health"]="API 서버"
+            ["https://school.buwoo.app"]="선생님 콘솔"
+            ["https://console.buwoo.app"]="본사 콘솔"
+            ["https://blocked.buwoo.app"]="차단 안내 페이지"
+            ["https://buwoo.co.kr"]="홍보 사이트"
+          )
+          FAILS=""
+          for url in "${!TARGETS[@]}"; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 "$url" || echo 000)
+            if [ "$code" != "200" ]; then
+              sleep 10
+              code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 "$url" || echo 000)
+            fi
+            if [ "$code" != "200" ]; then
+              FAILS="${FAILS}${NL}- ${TARGETS[$url]}: 응답코드 ${code}"
+            fi
+            echo "$code $url"
+          done
+          if [ -n "${SIMULATE}" ]; then
+            FAILS="${FAILS}${NL}- (테스트) 강제 실패 시뮬레이션"
+          fi
+          NOW_KST=$(TZ=Asia/Seoul date "+%m월 %d일 %H:%M")
+          # 직전 완료 run 결과 — 복구 알림 1회 발송용
+          PREV=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/uptime-probe.yml/runs?per_page=1&status=completed" \
+            --jq '.workflow_runs[0].conclusion' 2>/dev/null || echo unknown)
+          if [ -n "$FAILS" ]; then
+            send_tg "🚨 부우 서버 이상 감지 (${NOW_KST} 한국시간)${FAILS}${NL}${NL}30분마다 다시 점검합니다. 문제가 계속되면 이 알림이 반복돼요."
+            exit 1
+          fi
+          if [ "$PREV" = "failure" ]; then
+            send_tg "✅ 부우 서버 복구 확인 (${NOW_KST} 한국시간) — 모든 페이지가 정상 응답합니다."
+          fi
+          echo "all ok"
