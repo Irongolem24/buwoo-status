@@ -1,17 +1,24 @@
 # 부우 백업 dead-man 감시 (2026-06-12, 안정성 보험 트랙 ①)
 # 매일 04:30 KST (= 02:00 KST 백업 후): R2 의 최신 DB 덤프가 26시간보다 오래되면 텔레그램 경보.
 # 서버가 통째로 죽어 백업이 조용히 멈춰도, 이 검사는 GitHub(외부)에서 돌므로 반드시 울린다.
+# 주의 1: Actions run 은 기본 bash -e — 점검 실패가 "알림 없이 즉사"가 되지 않게 모든 외부 명령을 if 로 감싼다.
+# 주의 2: rclone 은 env-var 설정 시 stderr 에 NOTICE 를 찍는다 — stdout(JSON)과 분리 필수.
+# 주의 3: 공개 repo 스케줄은 60일간 커밋이 없으면 자동 비활성화 → 매월 1일 keepalive 빈 커밋.
 name: backup-deadman
 on:
   schedule:
     - cron: "30 19 * * *" # 19:30 UTC = 다음날 04:30 KST
   workflow_dispatch: {}
 
+permissions:
+  contents: write
+
 jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
+      - uses: actions/checkout@v4
       - name: check-r2-backup-freshness
         env:
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -29,20 +36,35 @@ jobs:
           }
           sudo apt-get update -qq >/dev/null && sudo apt-get install -y -qq rclone >/dev/null
           NOW_KST=$(TZ=Asia/Seoul date "+%m월 %d일 %H:%M")
-          if ! LIST=$(rclone lsjson r2:buwoo-vps-backup/full --files-only 2>&1); then
-            echo "$LIST"
+          if ! LIST=$(rclone lsjson r2:buwoo-vps-backup/full --files-only 2>/tmp/rclone.err); then
+            cat /tmp/rclone.err || true
             send_tg "🚨 부우 백업 점검 실패 (${NOW_KST} 한국시간) — 백업 저장소(R2)에 접근할 수 없습니다. 자격증명 또는 저장소 문제일 수 있어요."
             exit 1
           fi
-          NEWEST=$(echo "$LIST" | jq -r 'max_by(.ModTime).ModTime // empty')
+          NEWEST=$(echo "$LIST" | jq -r 'max_by(.ModTime).ModTime // empty' 2>/dev/null) || NEWEST=""
           if [ -z "$NEWEST" ]; then
-            send_tg "🚨 부우 백업 경보 (${NOW_KST} 한국시간) — 백업 저장소에 DB 덤프가 하나도 없습니다."
+            send_tg "🚨 부우 백업 경보 (${NOW_KST} 한국시간) — 백업 저장소에서 DB 덤프를 찾지 못했습니다 (목록이 비었거나 형식 오류)."
             exit 1
           fi
-          AGE_H=$(( ( $(date +%s) - $(date -d "$NEWEST" +%s) ) / 3600 ))
+          EPOCH_NEW=$(date -d "$NEWEST" +%s 2>/dev/null) || EPOCH_NEW=0
+          if [ "$EPOCH_NEW" = "0" ]; then
+            send_tg "🚨 부우 백업 경보 (${NOW_KST} 한국시간) — 최신 덤프의 시각(${NEWEST})을 해석하지 못했습니다."
+            exit 1
+          fi
+          AGE_H=$(( ( $(date +%s) - EPOCH_NEW ) / 3600 ))
           echo "newest dump: $NEWEST (age ${AGE_H}h)"
           if [ "$AGE_H" -gt 26 ]; then
             send_tg "🚨 부우 백업 경보 (${NOW_KST} 한국시간) — 마지막 DB 백업이 ${AGE_H}시간 전입니다 (정상: 24시간 이내). 서버의 백업 작업이 멈췄을 수 있어요."
             exit 1
           fi
           echo "backup fresh (${AGE_H}h) — OK"
+      - name: keepalive-commit
+        run: |
+          if [ "$(TZ=Asia/Seoul date +%d)" = "01" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "keepalive: 공개 repo 스케줄 60일 비활성화 방지"
+            git push
+          else
+            echo "keepalive skip (매월 1일에만)"
+          fi
