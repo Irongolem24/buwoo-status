@@ -1,0 +1,77 @@
+# 부우 아침 브리핑 (2026-06-12) — 매일 09:00 KST 무조건 1통 발송.
+# 목적: "알림이 없는 것"이 정상(무사)인지 감시 시스템 고장인지 구분 — 아침 인사가 안 오면 감시 자체 점검 신호.
+# (장애 시엔 uptime-probe/backup-deadman 이 별도로 즉시 경보하므로 이건 안심용 요약)
+name: morning-briefing
+on:
+  schedule:
+    - cron: "0 0 * * *" # 00:00 UTC = 09:00 KST (GitHub 사정으로 수십 분 늦을 수 있음)
+  workflow_dispatch: {}
+
+jobs:
+  brief:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: probe-and-brief
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          RCLONE_CONFIG_R2_TYPE: s3
+          RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+          RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+        run: |
+          set -u
+          NL=$'\n'
+          send_tg() {
+            curl -s --max-time 20 -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+              -d chat_id="${TG_CHAT}" --data-urlencode text="$1" >/dev/null || true
+          }
+          declare -A TARGETS=(
+            ["https://status.buwoo.app"]="웹 서버"
+            ["https://api.buwoo.app/health"]="API 서버"
+            ["https://school.buwoo.app"]="선생님 콘솔"
+            ["https://console.buwoo.app"]="본사 콘솔"
+            ["https://blocked.buwoo.app"]="차단 안내 페이지"
+            ["https://buwoo.co.kr"]="홍보 사이트"
+          )
+          FAILS=""
+          for url in "${!TARGETS[@]}"; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 "$url" || echo 000)
+            if [ "$code" != "200" ]; then
+              sleep 10
+              code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 "$url" || echo 000)
+            fi
+            if [ "$code" != "200" ]; then
+              FAILS="${FAILS}${NL}  - ${TARGETS[$url]}: 응답코드 ${code}"
+            fi
+            echo "$code $url"
+          done
+          if [ -z "$FAILS" ]; then
+            SITE_LINE="✅ 사이트·서버 6곳 모두 정상"
+          else
+            SITE_LINE="🚨 일부 이상:${FAILS}"
+          fi
+          sudo apt-get update -qq >/dev/null && sudo apt-get install -y -qq rclone >/dev/null
+          BK_LINE="🚨 백업 상태를 확인하지 못했습니다"
+          BK_BAD=1
+          if LIST=$(rclone lsjson r2:buwoo-vps-backup/full --files-only 2>/dev/null); then
+            NEWEST=$(echo "$LIST" | jq -r 'max_by(.ModTime).ModTime // empty' 2>/dev/null) || NEWEST=""
+            if [ -n "$NEWEST" ]; then
+              EPOCH_NEW=$(date -d "$NEWEST" +%s 2>/dev/null) || EPOCH_NEW=0
+              if [ "$EPOCH_NEW" != "0" ]; then
+                AGE_H=$(( ( $(date +%s) - EPOCH_NEW ) / 3600 ))
+                if [ "$AGE_H" -le 26 ]; then
+                  BK_LINE="✅ 최근 DB 백업: ${AGE_H}시간 전 (정상)"
+                  BK_BAD=0
+                else
+                  BK_LINE="🚨 마지막 DB 백업이 ${AGE_H}시간 전 (정상: 24시간 이내)"
+                fi
+              fi
+            fi
+          fi
+          NOW_KST=$(TZ=Asia/Seoul date "+%m월 %d일 %H:%M")
+          send_tg "☀️ 부우 아침 점검 (${NOW_KST} 한국시간)${NL}${SITE_LINE}${NL}${BK_LINE}${NL}${NL}이 아침 인사가 안 오는 날엔 감시 시스템 점검이 필요하다는 뜻이에요."
+          if [ -n "$FAILS" ] || [ "$BK_BAD" = "1" ]; then exit 1; fi
+          echo "briefing sent — all ok"
