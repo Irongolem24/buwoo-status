@@ -8,7 +8,7 @@
 name: uptime-probe
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "7,37 * * * *" # 정시(0분/30분)는 GitHub cron 혼잡으로 지연 심함 → off-peak 분으로
   workflow_dispatch:
     inputs:
       simulate_failure:

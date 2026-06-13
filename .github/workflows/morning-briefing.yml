@@ -4,7 +4,7 @@
 name: morning-briefing
 on:
   schedule:
-    - cron: "0 0 * * *" # 00:00 UTC = 09:00 KST (GitHub 사정으로 수십 분 늦을 수 있음)
+    - cron: "23 0 * * *" # 00:23 UTC = 09:23 KST (정시 혼잡 회피 — 보통 9시 반 전후 도착)
   workflow_dispatch: {}
 
 jobs:
